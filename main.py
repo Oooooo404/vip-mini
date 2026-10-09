@@ -2,6 +2,8 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from db import query
 import time, random
+import hashlib
+import html
 
 app = FastAPI(title="vip-mini")
 
@@ -21,8 +23,8 @@ def uid(token): # BUG-10: token 不校验过期时间
 # 1 注册 —— BUG-1: 用户名长度不校验，超长会触发 DB 报错
 @app.post("/api/user/register")
 def register(u: Reg):
-    query("INSERT INTO user(username,password,nickname) VALUES(%s,%s,%s)",
-    (u.username, u.password, u.nickname)) # BUG-8: 昵称未转义 → 存储型 XSS
+    safe_nickname = html.escape(u.nickname)
+    query("INSERT INTO user(username,password,nickname) VALUES(%s,%s,%s)", (u.username, u.password, safe_nickname))
     return {"code": 0, "msg": "ok"}
 
 # 2 登录
@@ -54,29 +56,42 @@ def create(o: OrderIn, token: str = Header(None)):
 
 # 6 支付回调 —— BUG-6: 不校验签名，谁都能伪造
 @app.post("/api/pay/callback")
-def pay(order_id: int, status: str):
+def pay(order_id: int, status: str, sign: str = ""):
+    # 简单签名校验：md5(order_id + status + 密钥)
+    expected = hashlib.md5(f"{order_id}{status}vip-mini-secret".encode()).hexdigest()
+    if sign != expected:
+        return {"code": 401, "msg": "签名无效"}
     query("UPDATE `order` SET status=%s WHERE id=%s", (status, order_id))
     return {"code": 0}
 
 # 7 订单列表 —— BUG-4: status 直接拼接 → SQL 注入；BUG-9: page_size 无上限
 @app.get("/api/order/list")
 def olist(token: str = Header(None), status: str = "", page_size: int = 10):
-    sql = f"SELECT * FROM `order` WHERE user_id={uid(token)}"
-    if status: sql += f" AND status='{status}'"
-    sql += f" LIMIT {page_size}"
-    return {"code": 0, "data": query(sql)}
+    u = uid(token)
+    if page_size > 100:
+        page_size = 100  # 加上限
+    if status:
+        r = query("SELECT * FROM `order` WHERE user_id=%s AND status=%s LIMIT %s", (u, status, page_size))
+    else:
+        r = query("SELECT * FROM `order` WHERE user_id=%s LIMIT %s", (u, page_size))
+    return {"code": 0, "data": r}
 
 # 8 订单详情 —— BUG-5: 不校验归属 → 越权查看他人订单
 @app.get("/api/order/detail")
 def odetail(order_id: int, token: str = Header(None)):
-    r = query("SELECT * FROM `order` WHERE id=%s", (order_id,))
+    u = uid(token)
+    r = query("SELECT * FROM `order` WHERE id=%s AND user_id=%s", (order_id, u))
     return {"code": 0, "data": r[0] if r else None}
 
 # 9 积分消耗 —— BUG-3: 不校验余额，可扣成负数
 @app.post("/api/point/consume")
 def consume(p: PointIn, token: str = Header(None)):
     u = uid(token)
-    query("UPDATE point SET score=score-%s,updated_at=NOW() WHERE user_id=%s", (p.score, u))
+    # 先查当前积分
+    r = query("SELECT score FROM point WHERE user_id=%s", (u,))
+    if not r or r[0]["score"] < p.score:
+        return {"code": 400, "msg": "积分不足"}
+    query("UPDATE point SET score=score-%s, updated_at=NOW() WHERE user_id=%s", (p.score, u))
     return {"code": 0}
 
 # 10 积分排行榜 —— BUG-2: 同分不按时间倒序
